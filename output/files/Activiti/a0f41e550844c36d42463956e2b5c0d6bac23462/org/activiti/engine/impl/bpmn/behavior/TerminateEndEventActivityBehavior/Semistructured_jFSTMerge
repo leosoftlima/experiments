@@ -1,0 +1,491 @@
+/* Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.activiti.engine.impl.bpmn.behavior; 
+
+import org.activiti.bpmn.model.CallActivity; 
+import org.activiti.bpmn.model.FlowElement; 
+import org.activiti.bpmn.model.FlowNode; 
+import org.activiti.bpmn.model.SubProcess; 
+import org.activiti.engine.delegate.DelegateExecution; 
+
+import java.util.ArrayList; 
+import java.util.Collections; 
+import java.util.HashMap; import java.util.List; 
+import java.util.Map; 
+
+import org.activiti.bpmn.model.EndEvent; 
+import org.activiti.bpmn.model.EventDefinition; 
+import org.activiti.bpmn.model.TerminateEventDefinition; import org.activiti.engine.delegate.event.ActivitiEventType; import org.activiti.engine.delegate.event.impl.ActivitiEventBuilder; 
+import org.activiti.engine.history.DeleteReason; 
+import org.activiti.engine.history.HistoricActivityInstance; 
+import org.activiti.engine.impl.HistoricActivityInstanceQueryImpl;  import org.activiti.engine.impl.cfg.ProcessEngineConfigurationImpl; import org.activiti.engine.impl.context.Context; import org.activiti.engine.impl.history.HistoryLevel; 
+import org.activiti.engine.impl.interceptor.CommandContext; import org.activiti.engine.impl.persistence.entity.ExecutionEntity; 
+import org.activiti.engine.impl.persistence.entity.ExecutionEntityManager; import org.activiti.engine.impl.persistence.entity.HistoricActivityInstanceEntity;    /**
+<<<<<<< MINE
+=======
+ * @author Martin Grofcik
+ * @author Tijs Rademakers
+>>>>>>> YOURS
+ * @author Joram Barrez
+ */public class  TerminateEndEventActivityBehavior extends FlowNodeActivityBehavior {
+	private static final long serialVersionUID = 1L;
+	
+  
+  protected EndEvent endEvent;
+	protected boolean terminateAll;
+	
+  protected boolean terminateMultiInstance;
+	
+
+  public TerminateEndEventActivityBehavior() {
+
+  }
+	
+
+  @Override
+  public void execute(DelegateExecution execution) {
+
+    CommandContext commandContext = Context.getCommandContext();
+    ExecutionEntityManager executionEntityManager = commandContext.getExecutionEntityManager();
+
+    if (terminateAll) {
+      terminateAllBehaviour(execution, commandContext, executionEntityManager);
+    } else if (terminateMultiInstance) {
+      terminateMultiInstanceRoot(execution, commandContext, executionEntityManager);
+    } else {
+      defaultTerminateEndEventBehaviour(execution, commandContext, executionEntityManager);
+    }
+  }
+	
+
+  protected void terminateAllBehaviour(DelegateExecution execution, CommandContext commandContext, ExecutionEntityManager executionEntityManager) {
+    ExecutionEntity rootExecutionEntity = executionEntityManager.findByRootProcessInstanceId(execution.getRootProcessInstanceId());
+    String deleteReason = createDeleteReason(execution.getCurrentActivityId());
+    deleteExecutionEntities(executionEntityManager, rootExecutionEntity, deleteReason);
+    endAllHistoricActivities(rootExecutionEntity.getId(), deleteReason);
+    commandContext.getHistoryManager().recordProcessInstanceEnd(rootExecutionEntity.getId(),
+        deleteReason, execution.getCurrentActivityId());
+  }
+	
+
+  protected void defaultTerminateEndEventBehaviour(DelegateExecution execution, CommandContext commandContext,
+      ExecutionEntityManager executionEntityManager) {
+
+    ExecutionEntity scopeExecutionEntity = executionEntityManager.findFirstScope((ExecutionEntity) execution);
+    sendProcessInstanceCancelledEvent(scopeExecutionEntity, execution.getCurrentFlowElement());
+
+    // If the scope is the process instance, we can just terminate it all
+    // Special treatment is needed when the terminated activity is a subprocess (embedded/callactivity/..)
+    // The subprocess is destroyed, but the execution calling it, continues further on.
+    // In case of a multi-instance subprocess, only one instance is terminated, the other instances continue to exist.
+
+    String deleteReason = createDeleteReason(execution.getCurrentActivityId());
+
+    if (scopeExecutionEntity.isProcessInstanceType() && scopeExecutionEntity.getSuperExecutionId() == null) {
+
+      endAllHistoricActivities(scopeExecutionEntity.getId(), deleteReason);
+      deleteExecutionEntities(executionEntityManager, scopeExecutionEntity, deleteReason);
+      commandContext.getHistoryManager().recordProcessInstanceEnd(scopeExecutionEntity.getId(), deleteReason, execution.getCurrentActivityId());
+
+    } else if (scopeExecutionEntity.getCurrentFlowElement() != null
+        && scopeExecutionEntity.getCurrentFlowElement() instanceof SubProcess) { // SubProcess
+
+      SubProcess subProcess = (SubProcess) scopeExecutionEntity.getCurrentFlowElement();
+
+      scopeExecutionEntity.setDeleteReason(deleteReason);
+      if (subProcess.hasMultiInstanceLoopCharacteristics()) {
+
+        Context.getAgenda().planDestroyScopeOperation(scopeExecutionEntity);
+        MultiInstanceActivityBehavior multiInstanceBehavior = (MultiInstanceActivityBehavior) subProcess.getBehavior();
+        multiInstanceBehavior.leave(scopeExecutionEntity);
+
+      } else {
+        Context.getAgenda().planDestroyScopeOperation(scopeExecutionEntity);
+        ExecutionEntity outgoingFlowExecution = executionEntityManager.createChildExecution(scopeExecutionEntity.getParent());
+        outgoingFlowExecution.setCurrentFlowElement(scopeExecutionEntity.getCurrentFlowElement());
+        Context.getAgenda().planTakeOutgoingSequenceFlowsOperation(outgoingFlowExecution, true);
+      }
+
+    } else if (scopeExecutionEntity.getParentId() == null
+        && scopeExecutionEntity.getSuperExecutionId() != null) { // CallActivity
+
+      ExecutionEntity callActivityExecution = scopeExecutionEntity.getSuperExecution();
+      CallActivity callActivity = (CallActivity) callActivityExecution.getCurrentFlowElement();
+
+      if (callActivity.hasMultiInstanceLoopCharacteristics()) {
+
+        MultiInstanceActivityBehavior multiInstanceBehavior = (MultiInstanceActivityBehavior) callActivity.getBehavior();
+        multiInstanceBehavior.leave(callActivityExecution);
+        executionEntityManager.deleteProcessInstanceExecutionEntity(scopeExecutionEntity.getId(), execution.getCurrentFlowElement().getId(), "terminate end event", false, false);
+
+      } else {
+
+        executionEntityManager.deleteProcessInstanceExecutionEntity(scopeExecutionEntity.getId(), execution.getCurrentFlowElement().getId(), "terminate end event", false, false);
+        ExecutionEntity superExecutionEntity = executionEntityManager.findById(scopeExecutionEntity.getSuperExecutionId());
+        Context.getAgenda().planTakeOutgoingSequenceFlowsOperation(superExecutionEntity, true);
+
+      }
+
+    }
+  }
+	
+
+  protected void endAllHistoricActivities(String processInstanceId, String deleteReason) {
+
+    if (!Context.getProcessEngineConfiguration().getHistoryLevel().isAtLeast(HistoryLevel.ACTIVITY)) {
+      return;
+    }
+
+    List<HistoricActivityInstanceEntity> historicActivityInstances = Context.getCommandContext().getHistoricActivityInstanceEntityManager()
+      .findUnfinishedHistoricActivityInstancesByProcessInstanceId(processInstanceId);
+
+    for (HistoricActivityInstanceEntity historicActivityInstance : historicActivityInstances) {
+      historicActivityInstance.markEnded(deleteReason);
+
+      // Fire event
+      ProcessEngineConfigurationImpl config = Context.getProcessEngineConfiguration();
+      if (config != null && config.getEventDispatcher().isEnabled()) {
+        config.getEventDispatcher().dispatchEvent(
+            ActivitiEventBuilder.createEntityEvent(ActivitiEventType.HISTORIC_ACTIVITY_INSTANCE_ENDED, historicActivityInstance));
+      }
+    }
+
+  }
+	
+
+  protected void terminateMultiInstanceRoot(DelegateExecution execution, CommandContext commandContext,
+      ExecutionEntityManager executionEntityManager) {
+
+    // When terminateMultiInstance is 'true', we look for the multi instance root and delete it from there.
+    ExecutionEntity miRootExecutionEntity = executionEntityManager.findFirstMultiInstanceRoot((ExecutionEntity) execution);
+    if (miRootExecutionEntity != null) {
+
+      // Create sibling execution to continue process instance execution before deletion
+      ExecutionEntity siblingExecution = executionEntityManager.createChildExecution(miRootExecutionEntity.getParent());
+      siblingExecution.setCurrentFlowElement(miRootExecutionEntity.getCurrentFlowElement());
+
+      deleteExecutionEntities(executionEntityManager, miRootExecutionEntity, createDeleteReason(miRootExecutionEntity.getActivityId()));
+
+      Context.getAgenda().planTakeOutgoingSequenceFlowsOperation(siblingExecution, true);
+    } else {
+      defaultTerminateEndEventBehaviour(execution, commandContext, executionEntityManager);
+    }
+  }
+	
+
+  protected void deleteExecutionEntities(ExecutionEntityManager executionEntityManager, ExecutionEntity rootExecutionEntity, String deleteReason) {
+
+    List<ExecutionEntity> childExecutions = executionEntityManager.collectChildren(rootExecutionEntity);
+    for (int i=childExecutions.size()-1; i>=0; i--) {
+      executionEntityManager.deleteExecutionAndRelatedData(childExecutions.get(i), deleteReason, false);
+    }
+    executionEntityManager.deleteExecutionAndRelatedData(rootExecutionEntity, deleteReason, false);
+  }
+	
+
+  protected void sendProcessInstanceCancelledEvent(DelegateExecution execution, FlowElement terminateEndEvent) {
+    if (Context.getProcessEngineConfiguration().getEventDispatcher().isEnabled()) {
+      if ((execution.isProcessInstanceType() && execution.getSuperExecutionId() == null) ||
+          (execution.getParentId() == null && execution.getSuperExecutionId() != null)) {
+
+        Context.getProcessEngineConfiguration().getEventDispatcher()
+            .dispatchEvent(ActivitiEventBuilder.createCancelledEvent(execution.getId(), execution.getProcessInstanceId(),
+                execution.getProcessDefinitionId(), execution.getCurrentFlowElement()));
+      }
+    }
+
+    dispatchExecutionCancelled(execution, terminateEndEvent);
+  }
+	
+
+  protected void dispatchExecutionCancelled(DelegateExecution execution, FlowElement terminateEndEvent) {
+
+    ExecutionEntityManager executionEntityManager = Context.getCommandContext().getExecutionEntityManager();
+
+    // subprocesses
+    for (DelegateExecution subExecution : executionEntityManager.findChildExecutionsByParentExecutionId(execution.getId())) {
+      dispatchExecutionCancelled(subExecution, terminateEndEvent);
+    }
+
+    // call activities
+    ExecutionEntity subProcessInstance = Context.getCommandContext().getExecutionEntityManager().findSubProcessInstanceBySuperExecutionId(execution.getId());
+    if (subProcessInstance != null) {
+      dispatchExecutionCancelled(subProcessInstance, terminateEndEvent);
+    }
+
+    // activity with message/signal boundary events
+    FlowElement currentFlowElement = execution.getCurrentFlowElement();
+    if (currentFlowElement instanceof FlowNode) {
+      dispatchActivityCancelled(execution, terminateEndEvent);
+    }
+  }
+	
+
+  protected void dispatchActivityCancelled(DelegateExecution execution, FlowElement terminateEndEvent) {
+    Context.getProcessEngineConfiguration()
+        .getEventDispatcher()
+        .dispatchEvent(
+            ActivitiEventBuilder.createActivityCancelledEvent(execution.getCurrentFlowElement().getId(),
+                execution.getCurrentFlowElement().getName(), execution.getId(), execution.getProcessInstanceId(),
+                execution.getProcessDefinitionId(), parseActivityType((FlowNode) execution.getCurrentFlowElement()), terminateEndEvent));
+  }
+	
+
+  protected String createDeleteReason(String activityId) {
+    return DeleteReason.TERMINATE_END_EVENT + " (" + activityId + ")";
+  }
+	
+
+  public boolean isTerminateAll() {
+    return terminateAll;
+  }
+	
+
+  public void setTerminateAll(boolean terminateAll) {
+    this.terminateAll = terminateAll;
+  }
+	
+
+  public boolean isTerminateMultiInstance() {
+    return terminateMultiInstance;
+  }
+	
+
+  public void setTerminateMultiInstance(boolean terminateMultiInstance) {
+    this.terminateMultiInstance = terminateMultiInstance;
+  }
+	 
+  
+  public TerminateEndEventActivityBehavior(EndEvent endEvent) {
+    this.endEvent = endEvent.clone();
+    
+    // Terminate all attribute
+    if (endEvent.getEventDefinitions() != null) {
+    	for (EventDefinition eventDefinition : endEvent.getEventDefinitions()) {
+    		if (eventDefinition instanceof TerminateEventDefinition) {
+    			TerminateEventDefinition terminateEventDefinition = (TerminateEventDefinition) eventDefinition;
+    			if (terminateEventDefinition.isTerminateAll()) {
+    				this.terminateAll = true;
+    				break;
+    			}
+    		}
+    	}
+    }
+    
+  }
+	<<<<<<< MINE
+=======
+public void execute(ActivityExecution execution) throws Exception {
+    ActivityImpl terminateEndEventActivity = (ActivityImpl) execution.getActivity();
+    
+    if (terminateAll) {
+    	ActivityExecution processInstanceExecution = findRootProcessInstanceExecution((ExecutionEntity) execution);
+    	terminateProcessInstanceExecution(execution, terminateEndEventActivity, processInstanceExecution);
+    } else {
+    	ActivityExecution scopeExecution = ScopeUtil.findScopeExecution(execution);
+    	if (scopeExecution != null) {
+    		terminateExecution(execution, terminateEndEventActivity, scopeExecution);
+    	} 
+    }
+    
+  }
+>>>>>>> YOURS
+
+	
+  
+  /**
+   * Finds the parent execution that is a process instance.
+   * For a callactivity, this will be the process instance representing the called process instance
+   * and NOT the root process instance! 
+   */
+  protected ActivityExecution findProcessInstanceExecution(ActivityExecution execution) {
+  	ActivityExecution currentExecution = execution;
+  	while (currentExecution.getParent() != null) {
+  		currentExecution = currentExecution.getParent();
+  	}
+  	return currentExecution;
+  }
+	
+  
+  
+  protected ActivityExecution findRootProcessInstanceExecution(ExecutionEntity execution) {
+    ExecutionEntity currentExecution = execution;
+    while (currentExecution.getParentId() != null || currentExecution.getSuperExecutionId() != null) {
+      ExecutionEntity parentExecution = currentExecution.getParent();
+      if (parentExecution != null) {
+        currentExecution = parentExecution;
+      } else if (currentExecution.getSuperExecutionId() != null) {
+        currentExecution = currentExecution.getSuperExecution();
+      }
+    }
+    return currentExecution;
+  }
+	<<<<<<< MINE
+=======
+protected void terminateExecution(ActivityExecution execution, ActivityImpl terminateEndEventActivity, ActivityExecution scopeExecution) {
+    // send cancelled event
+    sendCancelledEvent( execution, terminateEndEventActivity, scopeExecution);
+    
+    // destroy the scope
+    scopeExecution.destroyScope("terminate end event fired");
+
+    // set the scope execution to the terminate end event and make it end here.
+    // (the history should reflect that the execution ended here and we want an 'end time' for the
+    // historic activity instance.)
+    ((InterpretableExecution)scopeExecution).setActivity(terminateEndEventActivity);
+    // end the scope execution
+    scopeExecution.end();
+    
+    // Scope execution can already have been ended (for example when multiple seq flow arrive in the same terminate end event)
+    // in that case, we need to make sure the activity instance is ended
+    if (scopeExecution.isEnded()) {
+      Context.getCommandContext().getHistoryManager().recordActivityEnd((ExecutionEntity) execution);
+    } 
+    
+  }
+>>>>>>> YOURS
+
+	
+  
+  protected void terminateProcessInstanceExecution(ActivityExecution execution, ActivityImpl terminateEndEventActivity, ActivityExecution processInstanceExecution) {
+    sendCancelledEvent( execution, terminateEndEventActivity, processInstanceExecution);
+    deleteProcessInstance((ExecutionEntity) processInstanceExecution, execution, "terminate end event (" + terminateEndEventActivity.getId() + ")");
+  }
+	
+  
+  protected void deleteProcessInstance(ExecutionEntity processInstanceExecution, ActivityExecution execution, String deleteReason) {
+  	
+    List<ExecutionEntity> orderedExecutions = orderExecutionsRootToLeaf(processInstanceExecution);
+    Collections.reverse(orderedExecutions);
+    
+    endAllHistoricActivities(processInstanceExecution.getId());
+    
+    for (ExecutionEntity executionToDelete : orderedExecutions) {
+      
+    	executionToDelete.setDeleteReason(deleteReason);
+    	executionToDelete.setEnded(true);
+    	executionToDelete.setActive(false);
+    	executionToDelete.setDeleteRoot(true);
+      
+    	executionToDelete.remove();
+    }
+    
+    Context.getCommandContext().getHistoryManager().recordProcessInstanceEnd(processInstanceExecution.getId(), deleteReason, execution.getActivity().getId());
+  }
+	
+  
+  protected List<ExecutionEntity> orderExecutionsRootToLeaf(ExecutionEntity execution) {
+  	
+  	// Find root process instance
+  	ExecutionEntity rootExecution = execution;
+  	while (rootExecution.getParent() != null || rootExecution.getSuperExecution() != null) {
+  		rootExecution = rootExecution.getParent() != null ? rootExecution.getParent() : rootExecution.getSuperExecution();
+  	}
+  	
+  	return orderExecutionsRootToLeaf(rootExecution, new ArrayList<ExecutionEntity>());
+  }
+	
+  
+  protected List<ExecutionEntity> orderExecutionsRootToLeaf(ExecutionEntity rootExecution, List<ExecutionEntity> orderedExecutions) {
+    orderedExecutions.add(rootExecution);
+    
+    
+    // Children
+    if (rootExecution.getExecutions() != null && rootExecution.getExecutions().size() > 0) {
+    	for (ExecutionEntity childExecution : rootExecution.getExecutions()) {
+    		orderExecutionsRootToLeaf(childExecution, orderedExecutions);
+    	}
+    }
+    
+    // Called process instances (subprocess)
+    if (rootExecution.getSubProcessInstance() != null) {
+    	orderExecutionsRootToLeaf(rootExecution.getSubProcessInstance(), orderedExecutions);
+    }
+    
+    return orderedExecutions;
+  }
+	
+  
+  protected void endAllHistoricActivities(String processInstanceId) {
+    
+    if (!Context.getProcessEngineConfiguration().getHistoryLevel().isAtLeast(HistoryLevel.ACTIVITY)) {
+      return;
+    }
+    
+    Map<String, HistoricActivityInstanceEntity> historicActivityInstancMap = new HashMap<String, HistoricActivityInstanceEntity>();
+    
+    List<HistoricActivityInstance> historicActivityInstances = new HistoricActivityInstanceQueryImpl(Context.getCommandContext())
+      .processInstanceId(processInstanceId)
+      .unfinished()
+      .list();
+    for (HistoricActivityInstance historicActivityInstance : historicActivityInstances) {
+      historicActivityInstancMap.put(historicActivityInstance.getId(), (HistoricActivityInstanceEntity) historicActivityInstance);
+    }
+    
+    // Cached version overwites entity
+    List<HistoricActivityInstanceEntity> cachedHistoricActivityInstances = Context.getCommandContext().getDbSqlSession()
+        .findInCache(HistoricActivityInstanceEntity.class);
+    for (HistoricActivityInstanceEntity cachedHistoricActivityInstance : cachedHistoricActivityInstances) {
+      if (processInstanceId.equals(cachedHistoricActivityInstance.getProcessInstanceId())
+          && (cachedHistoricActivityInstance.getEndTime() == null)) {
+        historicActivityInstancMap.put(cachedHistoricActivityInstance.getId(), cachedHistoricActivityInstance);
+      }
+    }
+
+    for (HistoricActivityInstanceEntity historicActivityInstance : historicActivityInstancMap.values()) {
+      historicActivityInstance.markEnded(null);
+      
+      // Fire event
+      ProcessEngineConfigurationImpl config = Context.getProcessEngineConfiguration();
+      if (config != null && config.getEventDispatcher().isEnabled()) {
+        config.getEventDispatcher().dispatchEvent(
+            ActivitiEventBuilder.createEntityEvent(ActivitiEventType.HISTORIC_ACTIVITY_INSTANCE_ENDED, historicActivityInstance));
+      }
+    }
+    
+  }
+	<<<<<<< MINE
+=======
+protected void sendCancelledEvent(ActivityExecution execution, ActivityImpl terminateEndEventActivity, ActivityExecution scopeExecution) {
+    if (Context.getProcessEngineConfiguration().getEventDispatcher().isEnabled()) {
+      Context.getProcessEngineConfiguration().getEventDispatcher().dispatchEvent(
+              ActivitiEventBuilder.createCancelledEvent(execution.getId(), execution.getProcessInstanceId(),
+                      execution.getProcessDefinitionId(), terminateEndEventActivity));
+    }
+    dispatchExecutionCancelled(scopeExecution, terminateEndEventActivity);
+  }
+>>>>>>> YOURS
+
+	
+	<<<<<<< MINE
+=======
+protected void dispatchActivityCancelled(ActivityExecution execution, ActivityImpl activity, ActivityImpl causeActivity) {
+    Context.getProcessEngineConfiguration().getEventDispatcher().dispatchEvent(
+            ActivitiEventBuilder.createActivityCancelledEvent(activity.getId(),
+                    (String) activity.getProperties().get("name"),
+                    execution.getId(),
+                    execution.getProcessInstanceId(), execution.getProcessDefinitionId(),
+                    (String) activity.getProperties().get("type"),
+                    activity.getActivityBehavior().getClass().getCanonicalName(),
+                    causeActivity)
+    );
+  }
+>>>>>>> YOURS
+
+	
+  
+  public EndEvent getEndEvent() {
+    return this.endEvent;
+  }
+
+}
